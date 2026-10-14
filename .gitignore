@@ -53,3 +53,6 @@ venv.bak/
 Thumbs.db
 
 CLAUDE.md
+
+docs/ide/*.pdf
+docs/ide/*.md

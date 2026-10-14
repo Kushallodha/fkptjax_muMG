@@ -26,6 +26,7 @@ The public entry points are:
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 
@@ -185,6 +186,41 @@ def Rescaling_MG(
 
     return pk_ext * scale, pk_now_ext * scale
 
+def _ide_setup(ide, *, z, f0, fk, f0_linear, rescale_PS):
+    """Validate the IDE builder arguments; return ``(fQ, f0_table)``.
+
+    ``fQ`` (= ide.fQ) normalises the kernels (f(k)/f0 = 1); ``f0_table`` is the
+    f0 written to the tables (FOLPS's linear Kaiser and TNS f0): ``ide.fQ``
+    unless ``f0_linear`` overrides it. Checks raise ValueError for concrete
+    values and an equinox runtime error under jit.
+    """
+    import equinox as eqx
+
+    if fk is not None:
+        raise ValueError("ide= sets fk = ide.fQ on every k; do not also pass fk.")
+    if bool(rescale_PS):
+        raise ValueError("ide= is incompatible with rescale_PS: the IDE path takes P_cb(k, z) "
+                         "from the Boltzmann code as is.")
+    if jnp.ndim(ide.fQ) != 0:
+        raise ValueError("ide must hold the coefficients of a single redshift (scalar fields).")
+    fQ = jnp.asarray(ide.fQ, dtype=jnp.float64)
+    f0_table = fQ if f0_linear is None else jnp.asarray(f0_linear, dtype=jnp.float64)
+
+    checks = [(jnp.abs(jnp.asarray(ide.z_out) - jnp.asarray(z)) > 1e-8,
+               "ide.z_out does not match the redshift z of the power spectrum.")]
+    if f0 is not None:
+        target = "f0_linear" if f0_linear is not None else "ide.fQ"
+        checks.append((jnp.abs(jnp.asarray(f0) - f0_table) > 1e-10 * jnp.abs(f0_table),
+                       f"f0 must equal {target} when ide= is given (pass f0_linear to override "
+                       "the tables' linear f0)."))
+    for bad, msg in checks:
+        if isinstance(bad, jax.core.Tracer):
+            fQ = eqx.error_if(fQ, bad, msg)
+        elif bool(bad):
+            raise ValueError(msg)
+    return fQ, f0_table
+
+
 def Kfuncs_to_tables(
     k,
     pk,
@@ -250,6 +286,8 @@ def Kfuncs_to_tables(
     fk=None, f0=None,
     ingredients_fn=None,
     static_ctx=None,
+    ide=None,
+    f0_linear=None,
 ) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
     """
     Return (table_wiggle, table_now) in the A_full=False layout expected by FOLPS.
@@ -307,6 +345,19 @@ def Kfuncs_to_tables(
         itself does not know they changed if ``ingredients_fn`` was built once and reused --
         mirroring how ``mg_kernel_fn`` is passed fresh into ``full_shape.py``'s
         ``combine_bias_terms_spectrum3_poles`` on every call).
+    ide : fkptjax.ide.IDEKernelCoeffs or None, default=None
+        Interacting-dark-energy kernels (scale independent) for the redshift ``z``
+        of ``pk``. When given: f(k) = ide.fQ on every k and f0 = ide.fQ, so every
+        f(k)/f0 ratio is 1; the growth ODE, ``kernel_constants``, the MG full-kernel
+        solve and ``model``/``beyond_eds``/``fkpt_approximation`` are bypassed; the
+        loop kernels are the exact IDE ones (``calculate_jax``). ``pk``/``pk_now``
+        must be the IDE P_cb(k, z) from the Boltzmann code (``rescale_PS`` and
+        ``fk`` are rejected). Checks ``ide.z_out == z`` and, if passed,
+        ``f0 == ide.fQ``. ``kernel_constants`` in the return value is ``ide``.
+    f0_linear : float or None, default=None
+        Only with ``ide``: overrides the f0 written to the tables (the linear
+        Kaiser factor b1 + f0 mu^2 and the TNS f0 powers in FOLPS); the kernel
+        coefficients still use ide.fQ. Default: ide.fQ.
     w0, wa : float, default=-1.0, 0.0
         CPL dark-energy equation of state, ``w(a) = w0 + wa*(1-a)``. Only consumed by the
         ``HS`` and ``PHENOM``/``growth_index``/``growth_index_yukawa`` ``mu(k,eta)`` formulas
@@ -335,6 +386,12 @@ def Kfuncs_to_tables(
 
     k_ext, pk_ext = extrapolate_pklin(k, pk)
     _, pk_now_ext = extrapolate_pklin(k, pk_now)
+
+    if ide is not None:
+        f0, f0_table = _ide_setup(ide, z=z, f0=f0, fk=fk, f0_linear=f0_linear, rescale_PS=rescale_PS)
+        fk = f0 * jnp.ones_like(k)
+    elif f0_linear is not None:
+        raise ValueError("f0_linear is only used together with ide=.")
 
     # derivs/solver concretize every MG/cosmology parameter via float() to drive fkptjax's
     # own scipy-based growth ODE (DP) and squeezed-limit kernel-constants ODE below -- this is
@@ -544,7 +601,7 @@ def Kfuncs_to_tables(
             * _np_simpson(PSL_NW_h * j2_h, x=p_h)
         )
 
-    if bool(beyond_eds) and bool(fkpt_approximation):
+    if ide is None and bool(beyond_eds) and bool(fkpt_approximation):
         from fkptjax.ode import kernel_constants
         derivs, solver = _get_derivs_solver()
         KA, KAp, KR1, KR1p = kernel_constants(f0=f0, derivs=derivs, solver=solver)
@@ -586,7 +643,7 @@ def Kfuncs_to_tables(
     A_RQ = B_RQ = ApOverf0_RQ = BpOverf0_RQ = None
     A_fused_R = ApOverf0_fused_R = None
     CFD3_R = CFD3p_R = None
-    if bool(beyond_eds) and not bool(fkpt_approximation):
+    if ide is None and bool(beyond_eds) and not bool(fkpt_approximation):
         from fkptjax import mg_jax as _bj
         from fkptjax import MG_kernels as _mgk
 
@@ -647,7 +704,10 @@ def Kfuncs_to_tables(
         CFD3_R=CFD3_R, CFD3p_R=CFD3p_R,
         A_N=A_N, B_N=B_N, ApOverf0_N=ApOverf0_N, BpOverf0_N=BpOverf0_N,
         A_RQ=A_RQ, B_RQ=B_RQ, ApOverf0_RQ=ApOverf0_RQ, BpOverf0_RQ=BpOverf0_RQ,
+        ide=ide,
     )
+    if ide is not None:
+        f0 = f0_table  # tables' f0 column (FOLPS's linear Kaiser / TNS f0)
 
     def _arr(x):
         return jnp.asarray(x)
@@ -725,9 +785,9 @@ def Kfuncs_to_tables(
         f0,
     )
     if return_kernel_constants and return_raw_kfuncs:
-        return table_w, table_nw, (A, ApOverf0 * f0, CFD3, CFD3p), kfuncs
+        return table_w, table_nw, ((A, ApOverf0 * f0, CFD3, CFD3p) if ide is None else ide), kfuncs
     if return_kernel_constants:
-        return table_w, table_nw, (A, ApOverf0 * f0, CFD3, CFD3p)
+        return table_w, table_nw, ((A, ApOverf0 * f0, CFD3, CFD3p) if ide is None else ide)
     if return_raw_kfuncs:
         return table_w, table_nw, kfuncs
     return table_w, table_nw
@@ -816,6 +876,7 @@ def Kfuncs_to_tables_jax(
     eftde_eta_grid=None, eftde_h1_grid=None, eftde_h3_grid=None, eftde_h5_grid=None,
     eftde_scale_dependent=True, eftde_k2_pivot=0.01,
     gamma_0=0.54545, gamma_a=0.0, t_k=1000.0, d_s=0.0001,
+    ide=None, f0_linear=None,
 ):
     """Fully jax-traceable (jit/vmap-able) ``Kfuncs_to_tables``.
 
@@ -921,6 +982,11 @@ def Kfuncs_to_tables_jax(
         ``NotImplementedError`` for anything ``_resolve_mg_kind`` doesn't
         recognize. Has no effect when ``beyond_eds=False``. More expensive
         than ``True`` -- see :mod:`fkptjax.MG_kernels`'s performance note.
+    ide, f0_linear :
+        Interacting-dark-energy kernels and optional override of the tables'
+        linear f0; same meaning and checks as in :func:`Kfuncs_to_tables`. With
+        ``ide`` the growth ODE, ``kernel_constants_jax`` and the MG full-kernel
+        solve are skipped, and everything stays traceable.
     """
     import folps as folpsv2
     from folps.tools_jax import extrapolate_pklin, simpson, interp
@@ -970,7 +1036,12 @@ def Kfuncs_to_tables_jax(
     #
     # Mirrors how the rescaling branch already accepts caller-supplied
     # ``kernel_constants`` in place of its own ODE.
-    if fk is None:
+    if ide is not None:
+        f0, f0_table = _ide_setup(ide, z=z, f0=f0, fk=fk, f0_linear=f0_linear, rescale_PS=False)
+        fk_ext = f0 * jnp.ones_like(k_ext)
+    elif f0_linear is not None:
+        raise ValueError("f0_linear is only used together with ide=.")
+    elif fk is None:
         Y = DP_jax(k_ext, P, float(xnow), xstop)
         D_ext, Dp_ext = Y[0], Y[1]
         fk_ext = Dp_ext / D_ext
@@ -1032,7 +1103,7 @@ def Kfuncs_to_tables_jax(
     sigma2_NW = 1.0 / (6.0 * jnp.pi**2) * simpson(PSL_NW * (1.0 - j0 + 2.0 * j2), x=p)
     delta_sigma2_NW = 1.0 / (2.0 * jnp.pi**2) * simpson(PSL_NW * j2, x=p)
 
-    if bool(beyond_eds):
+    if ide is None and bool(beyond_eds):
         KA, KAp, KR1, KR1p = kernel_constants_jax(f0, P, float(xnow), xstop)
         A = KA
         ApOverf0 = KAp / f0
@@ -1064,7 +1135,7 @@ def Kfuncs_to_tables_jax(
     A_RQ = B_RQ = ApOverf0_RQ = BpOverf0_RQ = None
     A_fused_R = ApOverf0_fused_R = None
     CFD3_R = CFD3p_R = None
-    if bool(beyond_eds) and not bool(fkpt_approximation):
+    if ide is None and bool(beyond_eds) and not bool(fkpt_approximation):
         from fkptjax import MG_kernels as _mgk
 
         k_ext_q = calculator.logk_grid_jax
@@ -1149,7 +1220,10 @@ def Kfuncs_to_tables_jax(
         A_fused_R=A_fused_R, ApOverf0_fused_R=ApOverf0_fused_R,
         CFD3_R=CFD3_R, CFD3p_R=CFD3p_R,
         A_N=A_N, B_N=B_N, ApOverf0_N=ApOverf0_N, BpOverf0_N=BpOverf0_N,
-        A_RQ=A_RQ, B_RQ=B_RQ, ApOverf0_RQ=ApOverf0_RQ, BpOverf0_RQ=BpOverf0_RQ)
+        A_RQ=A_RQ, B_RQ=B_RQ, ApOverf0_RQ=ApOverf0_RQ, BpOverf0_RQ=BpOverf0_RQ,
+        ide=ide)
+    if ide is not None:
+        f0 = f0_table  # tables' f0 column (FOLPS's linear Kaiser / TNS f0)
 
     zeros = jnp.zeros_like(jnp.asarray(kout))
 
@@ -1171,9 +1245,9 @@ def Kfuncs_to_tables_jax(
     table_nw = _tab(1, (sigma2w_NW, sigma2_NW, delta_sigma2_NW, f0))
 
     if return_kernel_constants and return_raw_kfuncs:
-        return table_w, table_nw, (A, ApOverf0 * f0, CFD3, CFD3p), kfuncs
+        return table_w, table_nw, ((A, ApOverf0 * f0, CFD3, CFD3p) if ide is None else ide), kfuncs
     if return_kernel_constants:
-        return table_w, table_nw, (A, ApOverf0 * f0, CFD3, CFD3p)
+        return table_w, table_nw, ((A, ApOverf0 * f0, CFD3, CFD3p) if ide is None else ide)
     if return_raw_kfuncs:
         return table_w, table_nw, kfuncs
     return table_w, table_nw
@@ -1422,6 +1496,7 @@ def Kfuncs_to_tables_rescale_jax(
     static_ctx=None,
     kernel_constants=None,
     neutrino_correction=None,
+    ide=None,
     **kwargs,
 ):
     """
@@ -1453,6 +1528,11 @@ def Kfuncs_to_tables_rescale_jax(
     k = jnp.asarray(k, dtype=jnp.float64)
     pk = jnp.asarray(pk, dtype=jnp.float64)
     pk_now = jnp.asarray(pk_now, dtype=jnp.float64)
+
+    if ide is not None:
+        raise ValueError(
+            "Kfuncs_to_tables_rescale_jax does not support ide=: the IDE path takes P_cb(k, z) "
+            "from the Boltzmann code without (D_MG/D_GR)^2 rescaling. Use Kfuncs_to_tables_jax(..., ide=...).")
 
     # beyond_eds=True is supported in the rescaling branch live/JAX path only when
     # model-matched kernel constants are provided by a small calculator or

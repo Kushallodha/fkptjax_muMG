@@ -22,6 +22,7 @@ from functools import partial
 from typing import Dict, Any, Tuple
 
 from fkptjax.types import KFunctionsInitData, KFunctionsOut, Float64NDArray, AbsCalculator
+from fkptjax.ide import F2_G2, F3K_G3K
 
 
 def precompute_spline_matrix_factors(x: Array) -> Tuple[Array, Array, Array, int]:
@@ -223,6 +224,11 @@ def _calculate_jax_core(
         # like A_Q's own default.
         A_RQ: Array = None, B_RQ: Array = None,
         ApOverf0_RQ: Array = None, BpOverf0_RQ: Array = None,
+        # IDE kernel coefficients (fkptjax.ide.IDEKernelCoeffs). None (default)
+        # leaves every code path above unchanged; otherwise the second-order
+        # kernels of all three orderings and F3K/G3K use the exact IDE forms,
+        # and every f(k)/f0 ratio is 1 (f0 = fQ, scale-independent growth).
+        ide: Any = None,
     ) -> Any:
     """Core JAX calculation - all arrays are JAX arrays.
 
@@ -280,6 +286,9 @@ def _calculate_jax_core(
     psl_nw = psl_nw.T  # (10, 299, 1, 120)
     fkmp = fkmp.T  # (10, 299, 1, 120) - already has the correct shape!
 
+    if ide is not None:
+        fk = fp = fkmp = 1.0
+
     # Concatenate wiggle and no-wiggle components (matches numpy version)
     psl = jnp.concatenate([psl_w, psl_nw], axis=2)  # shape (NQ, nquadSteps-1, 2, Nk) -> (10, 299, 2, 120)
     # fkmp already has shape (10, 299, 1, 120) which is what we need
@@ -295,11 +304,14 @@ def _calculate_jax_core(
     # caller passes the same scalar A/ApOverf0 in both slots by default; the
     # full-kernel path (fkpt_approximation=False) passes genuinely different,
     # grid-shaped A(k,q) != B(k,q) here instead. See MG_kernels.A_B_grid.
-    F2evQ = (1.0/2.0 + 3.0/14.0 * A_Q + (1.0/2.0 - 3.0/14.0 * B_Q) * AngleEvQ2 +
-             AngleEvQ / 2.0 * (y/r + r/y))
-    G2evQ = (3.0/14.0 * A_Q * fsum + 3.0/14.0 * ApOverf0_Q +
-             (1.0/2.0 * fsum - 3.0/14.0 * B_Q * fsum - 3.0/14.0 * BpOverf0_Q) * AngleEvQ2 +
-             AngleEvQ / 2.0 * (fkmp * y/r + fp * r/y))
+    if ide is None:
+        F2evQ = (1.0/2.0 + 3.0/14.0 * A_Q + (1.0/2.0 - 3.0/14.0 * B_Q) * AngleEvQ2 +
+                 AngleEvQ / 2.0 * (y/r + r/y))
+        G2evQ = (3.0/14.0 * A_Q * fsum + 3.0/14.0 * ApOverf0_Q +
+                 (1.0/2.0 * fsum - 3.0/14.0 * B_Q * fsum - 3.0/14.0 * BpOverf0_Q) * AngleEvQ2 +
+                 AngleEvQ / 2.0 * (fkmp * y/r + fp * r/y))
+    else:
+        F2evQ, G2evQ = F2_G2(AngleEvQ, y/r + r/y, ide)
 
     # Precompute some temporary expressions that are used multiple times
     wpsl = w * psl
@@ -371,23 +383,29 @@ def _calculate_jax_core(
     # sMGPT's Ah[kminus,k_ext,q]: output leg kminus, input legs (k_ext,q).
     AngleEvR_Q = -x
     AngleEvR_Q2 = AngleEvR_Q * AngleEvR_Q
-    F2evR_Q = (1.0/2.0 + 3.0/14.0 * A_RQ_eff + (1.0/2.0 - 3.0/14.0 * B_RQ_eff) * AngleEvR_Q2 +
-               AngleEvR_Q / 2.0 * (1.0/r + r))
-    G2evR_Q = (3.0/14.0 * A_RQ_eff * (fp + fk) + 3.0/14.0 * ApOverf0_RQ_eff +
-               (1.0/2.0 * (fp + fk) - 3.0/14.0 * B_RQ_eff * (fp + fk) -
-                3.0/14.0 * BpOverf0_RQ_eff) * AngleEvR_Q2 +
-               AngleEvR_Q / 2.0 * (fk/r + fp*r))
+    if ide is None:
+        F2evR_Q = (1.0/2.0 + 3.0/14.0 * A_RQ_eff + (1.0/2.0 - 3.0/14.0 * B_RQ_eff) * AngleEvR_Q2 +
+                   AngleEvR_Q / 2.0 * (1.0/r + r))
+        G2evR_Q = (3.0/14.0 * A_RQ_eff * (fp + fk) + 3.0/14.0 * ApOverf0_RQ_eff +
+                   (1.0/2.0 * (fp + fk) - 3.0/14.0 * B_RQ_eff * (fp + fk) -
+                    3.0/14.0 * BpOverf0_RQ_eff) * AngleEvR_Q2 +
+                   AngleEvR_Q / 2.0 * (fk/r + fp*r))
+    else:
+        F2evR_Q, G2evR_Q = F2_G2(AngleEvR_Q, 1.0/r + r, ide)
 
     # "N ordering" (A_ij) -- sMGPT's Ah[q,k_ext,kminus]: output leg q,
     # input legs (k_ext,kminus).
     AngleEvN_Q = -((1.0 - rx) / y)
     AngleEvN_Q2 = AngleEvN_Q * AngleEvN_Q
     fksum = fk + fkmp
-    F2evN_Q = (1.0/2.0 + 3.0/14.0 * A_N_eff + (1.0/2.0 - 3.0/14.0 * B_N_eff) * AngleEvN_Q2 +
-               AngleEvN_Q / 2.0 * (y + 1.0/y))
-    G2evN_Q = (3.0/14.0 * A_N_eff * fksum + 3.0/14.0 * ApOverf0_N_eff +
-               (1.0/2.0 * fksum - 3.0/14.0 * B_N_eff * fksum - 3.0/14.0 * BpOverf0_N_eff) * AngleEvN_Q2 +
-               AngleEvN_Q / 2.0 * (fkmp*y + fk/y))
+    if ide is None:
+        F2evN_Q = (1.0/2.0 + 3.0/14.0 * A_N_eff + (1.0/2.0 - 3.0/14.0 * B_N_eff) * AngleEvN_Q2 +
+                   AngleEvN_Q / 2.0 * (y + 1.0/y))
+        G2evN_Q = (3.0/14.0 * A_N_eff * fksum + 3.0/14.0 * ApOverf0_N_eff +
+                   (1.0/2.0 * fksum - 3.0/14.0 * B_N_eff * fksum - 3.0/14.0 * BpOverf0_N_eff) * AngleEvN_Q2 +
+                   AngleEvN_Q / 2.0 * (fkmp*y + fk/y))
+    else:
+        F2evN_Q, G2evN_Q = F2_G2(AngleEvN_Q, y + 1.0/y, ide)
 
     Pout_bcast = Pout_stack[None, None, :, :]  # -> (1,1,2,Nk), broadcasts vs (NQ,nquadSteps-1,{1,2},Nk)
 
@@ -615,6 +633,9 @@ def _calculate_jax_core(
     fkminusp_r = fkminusp_r.T
     psl_kminus_r = jnp.concatenate([psl_rkm_w, psl_rkm_nw], axis=2)
 
+    if ide is not None:
+        fp_r = fkminusp_r = 1.0
+
     # ========== R-part ==========
     wpsl_r = w_r * psl_r
 
@@ -632,67 +653,71 @@ def _calculate_jax_core(
     # re-derivation against that source, cross-checked numerically against an
     # independent Wolfram evaluation, found the array-valued branch below
     # previously re-applied that scalar-only reconstruction by mistake.
-    if A_fused_R is None:
-        Gamma2evR = A * (1.0 - x2_r)
+    if ide is None:
+        if A_fused_R is None:
+            Gamma2evR = A * (1.0 - x2_r)
+        else:
+            Gamma2evR = A_fused_R
+        if ApOverf0_fused_R is None:
+            Gamma2evR_prime_term = ApOverf0 * (1.0 - x2_r)
+        else:
+            Gamma2evR_prime_term = ApOverf0_fused_R
+        # Gamma2fevR: sMGPT's own formula (3_P13type.wl) is
+        # "gamma2evR*(fkminusp+fp)/(2f0) + gamma2evRprime/(2f0)" -- the growth
+        # rate at the OUTPUT leg of the underlying D2 solve (kminus, since that
+        # solve is called at x=-x_r,k=k_ext,p=q so its output mode is kminus) plus
+        # at the loop q. A from-scratch re-derivation against that source (cross
+        # -checked numerically against an independent Wolfram evaluation) found
+        # this used to read fk (external-k growth) instead of fkminusp_r -- a
+        # pre-existing bug predating this module's fkpt_approximation=False work,
+        # present in the fkPT-approximated path too (masked there since this is a
+        # small, near-constant LS correction).
+        Gamma2fevR = Gamma2evR * (fkminusp_r + fp_r) / 2.0 + Gamma2evR_prime_term / 2.0
+        # C3Gamma3/C3Gamma3f: the scalar (fkPT) path reconstructs the LCDM-shaped
+        # x-dependence by hand (the "(1-x^2)^2/y^2" factor), because CFD3/CFD3p
+        # are single, x-independent large-scale-limit numbers -- that
+        # reconstruction is specific to the LS-approximated shape (sMGPT's own
+        # "C3gamma3LCDM"/"C3gamma3fLCDM" helpers, 3_P13type.wl) and must NOT be
+        # applied to CFD3_R/CFD3p_R (from MG_kernels.D3_fused_grid), which are
+        # already evaluated at the genuine x_r -- their x-dependence (and, for
+        # C3Gamma3, the factor-of-2 normalization difference between the
+        # LS-shape helper and the raw quantity) is already baked into the ODE
+        # solve itself. A from-scratch re-derivation against sMGPT's raw
+        # (non-approximated) F3K/G3K formulas, cross-checked numerically against
+        # an independent Wolfram evaluation, found the array-valued branch below
+        # previously kept the LS-shape-specific factor-of-2 by mistake.
+        #
+        # C3Gamma3f previously also carried an extra "(fk+2*fp_r)/3" growth-rate
+        # weighting that has NO counterpart in sMGPT's C3gamma3fLCDM (verified by
+        # directly comparing against 3_P13type.wl: C3gamma3fLCDM is just
+        # 2*(5/21)*lcdmCFprime*(1-x^2)^2/y^2, no growth-rate factor at all).
+        # Removing it was confirmed against sMGPT's own reference output (their
+        # BGS_F5/fkKernels AllFunctions table): P13dt/P13tt went from ~4-6% off
+        # to <1% agreement, with P13dd (which never had this factor) unaffected.
+        if CFD3_R is None:
+            C3Gamma3 = 2.0 * 5.0/21.0 * CFD3 * (1.0 - x2_r) * (1.0 - x2_r) / y2_r
+        else:
+            C3Gamma3 = 5.0/21.0 * CFD3_R
+        if CFD3p_R is None:
+            C3Gamma3f = 2.0 * 5.0/21.0 * CFD3p * (1.0 - x2_r) * (1.0 - x2_r) / y2_r
+        else:
+            C3Gamma3f = 5.0/21.0 * CFD3p_R
+        # NOTE: the middle term below uses fk (external-k growth), matching sMGPT's
+        # G3K term "1/3*C2*(fk/f0)*(k^2-kpx)/(k^2+p^2-2pkx)*gamma2evR" (3_P13type.wl)
+        # exactly -- a from-scratch re-derivation against that source found this used
+        # to read fp_r (loop-q growth) here, a pre-existing bug predating this
+        # module's fkpt_approximation=False work (present in the fkPT-approximated
+        # path too, just masked there because Gamma2evR/Gamma2fevR are small,
+        # near-constant LS corrections). The OTHER fp_r below (last term) is
+        # correct as-is -- sMGPT's own formula calls for fp (loop q) there.
+        G3K = (
+            C3Gamma3f / 2.0 + (2.0 * Gamma2fevR * x_r) / (7.0 * r_r) - (fk * x2_r) / (6.0 * r2_r)
+            + fk * Gamma2evR * (1.0 - r_r * x_r) / (7.0 * y2_r)
+            - 1.0/7.0 * (fp_r * Gamma2evR + 2.0 * Gamma2fevR) * (1.0 - x2_r) / y2_r)
+        F3K = C3Gamma3 / 6.0 - x2_r / (6.0 * r2_r) + (Gamma2evR * x_r * (1.0 - r_r * x_r)) / (7.0 * r_r * y2_r)
     else:
-        Gamma2evR = A_fused_R
-    if ApOverf0_fused_R is None:
-        Gamma2evR_prime_term = ApOverf0 * (1.0 - x2_r)
-    else:
-        Gamma2evR_prime_term = ApOverf0_fused_R
-    # Gamma2fevR: sMGPT's own formula (3_P13type.wl) is
-    # "gamma2evR*(fkminusp+fp)/(2f0) + gamma2evRprime/(2f0)" -- the growth
-    # rate at the OUTPUT leg of the underlying D2 solve (kminus, since that
-    # solve is called at x=-x_r,k=k_ext,p=q so its output mode is kminus) plus
-    # at the loop q. A from-scratch re-derivation against that source (cross
-    # -checked numerically against an independent Wolfram evaluation) found
-    # this used to read fk (external-k growth) instead of fkminusp_r -- a
-    # pre-existing bug predating this module's fkpt_approximation=False work,
-    # present in the fkPT-approximated path too (masked there since this is a
-    # small, near-constant LS correction).
-    Gamma2fevR = Gamma2evR * (fkminusp_r + fp_r) / 2.0 + Gamma2evR_prime_term / 2.0
-    # C3Gamma3/C3Gamma3f: the scalar (fkPT) path reconstructs the LCDM-shaped
-    # x-dependence by hand (the "(1-x^2)^2/y^2" factor), because CFD3/CFD3p
-    # are single, x-independent large-scale-limit numbers -- that
-    # reconstruction is specific to the LS-approximated shape (sMGPT's own
-    # "C3gamma3LCDM"/"C3gamma3fLCDM" helpers, 3_P13type.wl) and must NOT be
-    # applied to CFD3_R/CFD3p_R (from MG_kernels.D3_fused_grid), which are
-    # already evaluated at the genuine x_r -- their x-dependence (and, for
-    # C3Gamma3, the factor-of-2 normalization difference between the
-    # LS-shape helper and the raw quantity) is already baked into the ODE
-    # solve itself. A from-scratch re-derivation against sMGPT's raw
-    # (non-approximated) F3K/G3K formulas, cross-checked numerically against
-    # an independent Wolfram evaluation, found the array-valued branch below
-    # previously kept the LS-shape-specific factor-of-2 by mistake.
-    #
-    # C3Gamma3f previously also carried an extra "(fk+2*fp_r)/3" growth-rate
-    # weighting that has NO counterpart in sMGPT's C3gamma3fLCDM (verified by
-    # directly comparing against 3_P13type.wl: C3gamma3fLCDM is just
-    # 2*(5/21)*lcdmCFprime*(1-x^2)^2/y^2, no growth-rate factor at all).
-    # Removing it was confirmed against sMGPT's own reference output (their
-    # BGS_F5/fkKernels AllFunctions table): P13dt/P13tt went from ~4-6% off
-    # to <1% agreement, with P13dd (which never had this factor) unaffected.
-    if CFD3_R is None:
-        C3Gamma3 = 2.0 * 5.0/21.0 * CFD3 * (1.0 - x2_r) * (1.0 - x2_r) / y2_r
-    else:
-        C3Gamma3 = 5.0/21.0 * CFD3_R
-    if CFD3p_R is None:
-        C3Gamma3f = 2.0 * 5.0/21.0 * CFD3p * (1.0 - x2_r) * (1.0 - x2_r) / y2_r
-    else:
-        C3Gamma3f = 5.0/21.0 * CFD3p_R
-    # NOTE: the middle term below uses fk (external-k growth), matching sMGPT's
-    # G3K term "1/3*C2*(fk/f0)*(k^2-kpx)/(k^2+p^2-2pkx)*gamma2evR" (3_P13type.wl)
-    # exactly -- a from-scratch re-derivation against that source found this used
-    # to read fp_r (loop-q growth) here, a pre-existing bug predating this
-    # module's fkpt_approximation=False work (present in the fkPT-approximated
-    # path too, just masked there because Gamma2evR/Gamma2fevR are small,
-    # near-constant LS corrections). The OTHER fp_r below (last term) is
-    # correct as-is -- sMGPT's own formula calls for fp (loop q) there.
-    G3K = (
-        C3Gamma3f / 2.0 + (2.0 * Gamma2fevR * x_r) / (7.0 * r_r) - (fk * x2_r) / (6.0 * r2_r)
-        + fk * Gamma2evR * (1.0 - r_r * x_r) / (7.0 * y2_r)
-        - 1.0/7.0 * (fp_r * Gamma2evR + 2.0 * Gamma2fevR) * (1.0 - x2_r) / y2_r)
-    F3K = C3Gamma3 / 6.0 - x2_r / (6.0 * r2_r) + (Gamma2evR * x_r * (1.0 - r_r * x_r)) / (7.0 * r_r * y2_r)
+        # IDE: exact scale-independent kernels (fkptjax.ide; Kamble & Ishak notes, Sec. 4.3).
+        F3K, G3K = F3K_G3K(r_r, x_r, ide)
 
     P13dd_B = jnp.sum(wpsl_r * (6.0 * r2_r * F3K), axis=0)
     P13du_B = jnp.sum(wpsl_r * (3.0 * r2_r * G3K + 3.0 * r2_r * F3K * fk), axis=0)
@@ -933,7 +958,8 @@ class JaxCalculator(AbsCalculator):
                  A_N: Any = None, B_N: Any = None,
                  ApOverf0_N: Any = None, BpOverf0_N: Any = None,
                  A_RQ: Any = None, B_RQ: Any = None,
-                 ApOverf0_RQ: Any = None, BpOverf0_RQ: Any = None) -> KFunctionsOut:
+                 ApOverf0_RQ: Any = None, BpOverf0_RQ: Any = None,
+                 ide: Any = None) -> KFunctionsOut:
         """Evaluate k-functions given input power spectra.
 
         Args:
@@ -972,6 +998,11 @@ class JaxCalculator(AbsCalculator):
                 -- i.e. the squeezed (``fkpt_approximation=True``) path pays
                 no extra cost, it just reuses the same scalar for all three
                 legs instead of running a separately-discretized shortcut.
+            ide: ``fkptjax.ide.IDEKernelCoeffs`` or ``None`` (default). When
+                given, the loop kernels are the exact IDE ones and every
+                f(k)/f0 ratio is 1; A/ApOverf0/CFD3/CFD3p and the ``*_Q``/
+                ``*_R``/``*_N`` overrides are then ignored by the kernels.
+                The caller must pass ``f0 = ide.fQ``.
 
         Returns:
             KFunctionsOut containing all computed k-functions (as numpy arrays)
@@ -1021,6 +1052,7 @@ class JaxCalculator(AbsCalculator):
             self.spline_y_r['a_flat'], self.spline_y_r['b_flat'], self.spline_y_r['a3_flat'],
             self.spline_y_r['b3_flat'], self.spline_y_r['h2_flat'],
             A_RQ, B_RQ, ApOverf0_RQ, BpOverf0_RQ,
+            ide,
         )
 
         # NOT converted to numpy (was: tuple(np.asarray(r) for r in results)) -- this is the
@@ -1036,7 +1068,8 @@ class JaxCalculator(AbsCalculator):
                      A_fused_R=None, ApOverf0_fused_R=None,
                      CFD3_R=None, CFD3p_R=None,
                      A_N=None, B_N=None, ApOverf0_N=None, BpOverf0_N=None,
-                     A_RQ=None, B_RQ=None, ApOverf0_RQ=None, BpOverf0_RQ=None):
+                     A_RQ=None, B_RQ=None, ApOverf0_RQ=None, BpOverf0_RQ=None,
+                     ide=None):
         """Fully jax-traceable variant of :meth:`evaluate`.
 
         Identical to ``evaluate`` but keeps everything in ``jax.numpy`` (no
@@ -1077,5 +1110,6 @@ class JaxCalculator(AbsCalculator):
             self.spline_y_r['a_flat'], self.spline_y_r['b_flat'], self.spline_y_r['a3_flat'],
             self.spline_y_r['b3_flat'], self.spline_y_r['h2_flat'],
             A_RQ, B_RQ, ApOverf0_RQ, BpOverf0_RQ,
+            ide,
         )
         return KFunctionsOut(*results)

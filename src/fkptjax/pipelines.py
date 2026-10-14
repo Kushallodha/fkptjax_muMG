@@ -16,6 +16,11 @@ Three routes are exposed:
 ``rescale_branch_poles``
     JAX-traceable rescaling-branch route through
     ``Kfuncs_to_tables_rescale_jax``.
+
+The first two routes accept ``ide`` (a :class:`fkptjax.ide.IDEKernelCoeffs`)
+and ``f0_linear``: the tables are built with the IDE kernels and the same
+object sets the IDE IR damping in the RSD step. ``ide=None`` (default) leaves
+every route unchanged.
 """
 
 from __future__ import annotations
@@ -67,8 +72,11 @@ class FKPTTableState(NamedTuple):
     fk_norm, f0, fk
         Normalized growth rate, low-k growth rate, and full growth-rate grid.
     kernel_constants
-        Tuple ``(A, Ap, CFD3, CFD3p)`` when requested from the builder;
-        otherwise ``None``.
+        Tuple ``(A, Ap, CFD3, CFD3p)`` when requested from the builder (the
+        ``IDEKernelCoeffs`` for an IDE build); otherwise ``None``.
+    ide
+        ``IDEKernelCoeffs`` the tables were built with, or ``None``. Used by
+        :func:`poles_from_tables` for the IDE IR damping.
     """
 
     table_w: tuple[Any, ...]
@@ -84,6 +92,7 @@ class FKPTTableState(NamedTuple):
     f0: Any
     fk: Any
     kernel_constants: Any = None
+    ide: Any = None
 
 
 def split_folps_tables(table_w: Sequence[Any], table_now: Sequence[Any]) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
@@ -108,6 +117,7 @@ def make_table_state(
     table_w: Sequence[Any],
     table_now: Sequence[Any],
     kernel_constants: Any = None,
+    ide: Any = None,
 ) -> FKPTTableState:
     """Build an :class:`FKPTTableState` from raw builder outputs."""
     table_w = tuple(table_w)
@@ -130,6 +140,7 @@ def make_table_state(
         f0=f0,
         fk=fk,
         kernel_constants=kernel_constants,
+        ide=ide,
     )
 
 
@@ -140,9 +151,15 @@ def _call_table_builder(
     pk: Any,
     pk_now: Any,
     return_kernel_constants: bool = True,
+    ide: Any = None,
+    f0_linear: Any = None,
     **fkpt_params: Any,
 ) -> FKPTTableState:
     """Call a ``Kfuncs_to_tables*`` builder and normalize its return value."""
+    if ide is not None:
+        fkpt_params["ide"] = ide
+    if f0_linear is not None:
+        fkpt_params["f0_linear"] = f0_linear
     result = builder(
         k=k,
         pk=pk,
@@ -155,7 +172,7 @@ def _call_table_builder(
     else:
         table_w, table_now = result
         kernel_constants = None
-    return make_table_state(table_w, table_now, kernel_constants=kernel_constants)
+    return make_table_state(table_w, table_now, kernel_constants=kernel_constants, ide=ide)
 
 
 def poles_from_tables(
@@ -174,6 +191,7 @@ def poles_from_tables(
     A_full: bool = False,
     use_TNS_model: bool = False,
     to_poles: Any = None,
+    ide: Any = None,
 ) -> Any:
     """Project an already-built FKPT table state to RSD multipoles.
 
@@ -181,7 +199,11 @@ def poles_from_tables(
     This is the legacy downstream-wrapper behaviour and is the safest path when
     the caller owns the exact quadrature convention.  If ``to_poles`` is not provided, fall back to the standalone
     fkptjax projector through ``tables_to_poles``.
+
+    ``ide`` defaults to ``state.ide`` (the coefficients the tables were built
+    with); pass it explicitly only to override.
     """
+    ide = state.ide if ide is None else ide
     if to_poles is not None:
         pkmu = tables_to_pkmu(
             kap,
@@ -194,6 +216,7 @@ def poles_from_tables(
             damping=damping,
             A_full=A_full,
             use_TNS_model=use_TNS_model,
+            ide=ide,
         )
         return to_poles(jac * pkmu)
 
@@ -212,6 +235,7 @@ def poles_from_tables(
         ells=tuple(ells),
         A_full=A_full,
         use_TNS_model=use_TNS_model,
+        ide=ide,
     )
 
 def _pipeline_poles(
@@ -234,6 +258,8 @@ def _pipeline_poles(
     use_TNS_model: bool = False,
     return_kernel_constants: bool = True,
     to_poles: Any = None,
+    ide: Any = None,
+    f0_linear: Any = None,
     **fkpt_params: Any,
 ) -> tuple[Any, FKPTTableState]:
     """Shared implementation for the public pipeline routes."""
@@ -243,6 +269,8 @@ def _pipeline_poles(
         pk=pk,
         pk_now=pk_now,
         return_kernel_constants=return_kernel_constants,
+        ide=ide,
+        f0_linear=f0_linear,
         **fkpt_params,
     )
     poles = poles_from_tables(
@@ -283,12 +311,15 @@ def full_method_poles(
     use_TNS_model: bool = False,
     return_kernel_constants: bool = True,
     to_poles: Any = None,
+    ide: Any = None,
+    f0_linear: Any = None,
     **fkpt_params: Any,
 ) -> tuple[Any, FKPTTableState]:
     """Run the legacy/eager FKPT table builder and return RSD multipoles.
 
     ``fkpt_params`` are forwarded directly to :func:`Kfuncs_to_tables`; they must
-    include the usual FKPT options such as ``z`` and ``Om``.
+    include the usual FKPT options such as ``z`` and ``Om``. ``ide``/``f0_linear``:
+    see :func:`Kfuncs_to_tables`; ``ide`` also sets the IR damping.
     """
     return _pipeline_poles(
         Kfuncs_to_tables,
@@ -309,6 +340,8 @@ def full_method_poles(
         use_TNS_model=use_TNS_model,
         return_kernel_constants=return_kernel_constants,
         to_poles=to_poles,
+        ide=ide,
+        f0_linear=f0_linear,
         **fkpt_params,
     )
 
@@ -333,6 +366,8 @@ def binning_jax_poles(
     return_kernel_constants: bool = True,
     to_poles: Any = None,
     static_ctx: Any = None,
+    ide: Any = None,
+    f0_linear: Any = None,
     **fkpt_params: Any,
 ) -> tuple[Any, FKPTTableState]:
     """Run the fully JAX PHENOM/binning route and return RSD multipoles.
@@ -340,6 +375,8 @@ def binning_jax_poles(
     This is the route to use for the jaxmapse/binning model.  For repeated calls,
     pass a ``static_ctx`` created by :func:`build_jax_static_ctx` so the kernel
     grids and BAO Bessel arrays are not rebuilt at every likelihood evaluation.
+    It is also the IDE route: ``ide``/``f0_linear`` as in
+    :func:`Kfuncs_to_tables_jax`, and ``ide`` also sets the IR damping.
     """
     if static_ctx is not None:
         fkpt_params["static_ctx"] = static_ctx
@@ -362,6 +399,8 @@ def binning_jax_poles(
         use_TNS_model=use_TNS_model,
         return_kernel_constants=return_kernel_constants,
         to_poles=to_poles,
+        ide=ide,
+        f0_linear=f0_linear,
         **fkpt_params,
     )
 
@@ -387,6 +426,8 @@ def rescale_branch_poles(
     to_poles: Any = None,
     static_ctx: Any = None,
     kernel_constants: Any = None,
+    ide: Any = None,
+    f0_linear: Any = None,
     **fkpt_params: Any,
 ) -> tuple[Any, FKPTTableState]:
     """Run the JAX rescaling branch and return RSD multipoles.
@@ -403,7 +444,13 @@ def rescale_branch_poles(
     kernel_constants
         Optional beyond-EdS constants object/dict/tuple.  This is required when
         ``beyond_eds=True`` for the rescaling branch.
+    ide, f0_linear
+        Not supported here (the IDE path takes P_cb from the Boltzmann code
+        without rescaling); passing either raises. Use :func:`binning_jax_poles`.
     """
+    if ide is not None or f0_linear is not None:
+        raise ValueError("rescale_branch_poles does not support ide/f0_linear; "
+                         "use binning_jax_poles(..., ide=...) for IDE.")
     if static_ctx is not None:
         fkpt_params["static_ctx"] = static_ctx
     if kernel_constants is not None:

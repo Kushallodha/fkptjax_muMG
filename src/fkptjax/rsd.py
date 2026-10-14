@@ -186,6 +186,42 @@ def project_to_poles(pkmu: Any, mu: Any, wmu: Any, ells: Sequence[int] = (0, 2, 
     return jnp.asarray(out)
 
 
+def _ide_rsd_pkmu(calc, k, mu, pars, table, table_now, ide, IR_resummation, damping):
+    """FOLPS ``get_rsd_pkmu`` with the IDE BAO damping (Kamble & Ishak IDE notes, Sec. 6, eq. 53).
+
+    Line-for-line FOLPS's ``RSDMultipolesPowerSpectrumCalculator.get_rsd_pkmu``
+    (default ``damping_method``/``use_GTNS``), except that Sigma^2_tot comes from
+    :func:`fkptjax.ide.ir_sigma2_tot` with Gamma1 and fPsi from ``ide``. The same
+    Sigma^2_tot feeds both exp(-k^2 Sigma^2_tot) and the (1 + k^2 Sigma^2_tot)
+    factor, so the one-loop wiggle cancellation is preserved. FOLPS's own
+    ``get_eft_pkmu`` (loops, TNS, counterterms, shot noise) is used unchanged.
+    """
+    import importlib
+    from fkptjax.ide import ir_sigma2_tot
+
+    ff = importlib.import_module("folps.folps")
+    damping_method = ff._normalize_damping_method(None)
+    if calc.model == "EFT":
+        damping_method = "loop+ctr"
+    table = calc.interp_table(k, table, ff.A_full_status)
+    table_now = calc.interp_table(k, table_now, ff.A_full_status)
+    b1 = pars[0]
+    f0 = table[-1]
+    fk = table[1] * f0
+    pkl, pkl_now = table[0], table_now[0]
+    sigma2, delta_sigma2 = table_now[-3:-1]
+    W_tree = 1.0
+    if damping_method.startswith("tree"):
+        if damping not in ("exp", "lor", "vdg"):
+            raise ValueError(f"damping_method={damping_method!r} requires damping 'exp', 'lor' or 'vdg', got {damping!r}")
+        W_tree = ff.fog_damping((k * mu, pars[-1]), (k * mu, pars[-1]), f=f0, sigma2v=table[-2], damping=damping)
+    sigma2t = ir_sigma2_tot(mu, sigma2, delta_sigma2, ide) if IR_resummation else 0.0
+    damp = jnp.exp(-k**2 * sigma2t)
+    return (W_tree * (b1 + fk * mu**2)**2 * (pkl_now + damp * (pkl - pkl_now) * (1 + k**2 * sigma2t))
+            + damp * calc.get_eft_pkmu(k, mu, pars, table, damping, damping_method=damping_method)
+            + (1 - damp) * calc.get_eft_pkmu(k, mu, pars, table_now, damping, damping_method=damping_method))
+
+
 @partial(
     jit,
     static_argnames=(
@@ -209,6 +245,7 @@ def tables_to_pkmu(
     damping: Any = None,
     A_full: bool = False,
     use_TNS_model: bool = False,
+    ide: Any = None,
 ) -> Any:
     """Evaluate the FOLPS redshift-space ``P(k, mu)`` from FKPT tables.
 
@@ -229,6 +266,13 @@ def tables_to_pkmu(
     A_full, use_TNS_model
         Passed to ``folps.MatrixCalculator``.  The current FKPT layout uses
         ``A_full=False`` and ``use_TNS_model=False``.
+    ide
+        ``fkptjax.ide.IDEKernelCoeffs`` (the same object the tables were built
+        with) or ``None``. ``None`` (default) calls FOLPS's ``get_rsd_pkmu``
+        unchanged. Otherwise the IR-resummation damping uses the IDE
+        displacement, Sigma^2_tot = Gamma1^2 [(1 + fPsi mu^2 (2 + fPsi)) Sigma^2 +
+        fPsi^2 mu^2 (mu^2 - 1) dSigma^2], in both the exponential and the
+        (1 + k^2 Sigma^2_tot) factor; the Kaiser factor uses the tables' f0.
 
     Returns
     -------
@@ -243,6 +287,9 @@ def tables_to_pkmu(
 
     calc = folpsv2.RSDMultipolesPowerSpectrumCalculator(model="EFT")
     pars2 = calc.set_bias_scheme(pars=pars, bias_scheme=bias_scheme)
+    if ide is not None:
+        return _ide_rsd_pkmu(calc, kap, muap, pars2, table_all[:ncols], table_all[ncols:],
+                             ide, IR_resummation, damping)
     return calc.get_rsd_pkmu(
         kap,
         muap,
@@ -282,6 +329,7 @@ def tables_to_poles(
     ells: Sequence[int] = (0, 2, 4),
     A_full: bool = False,
     use_TNS_model: bool = False,
+    ide: Any = None,
 ) -> Any:
     """Evaluate and project the FOLPS RSD model to multipoles.
 
@@ -294,9 +342,9 @@ def tables_to_poles(
         pkmu = calc.get_rsd_pkmu(...)
         poles = to_poles(jac * pkmu)
 
-    Parameters are the same as :func:`tables_to_pkmu`, with the addition of
-    ``jac``, ``mu``, ``wmu`` and ``ells`` for AP Jacobian and multipole
-    projection.
+    Parameters are the same as :func:`tables_to_pkmu` (including ``ide``),
+    with the addition of ``jac``, ``mu``, ``wmu`` and ``ells`` for AP Jacobian
+    and multipole projection.
     """
     pkmu = tables_to_pkmu(
         kap,
@@ -309,5 +357,6 @@ def tables_to_poles(
         damping=damping,
         A_full=A_full,
         use_TNS_model=use_TNS_model,
+        ide=ide,
     )
     return project_to_poles(jac * pkmu, mu, wmu, ells=ells)
